@@ -142,6 +142,32 @@
     </section>
 
     <section class="card">
+      <h2>换乘保联决策</h2>
+      <p class="hint">沿用下方延误排程输入：勾选 1～40 个班次（总停靠 ≤ 200）、填写首发延误（0～120 分钟，
+        未填按 0）与区间清空时间（0～30 分钟），另填 0～10000 分钟额外晚点预算，并添加 1～8 组换乘
+        （前后班次及从 0 起的停靠序号、1～1000 人）。每组须为不同班次在同一站点的换乘：原时刻表满足
+        本站换乘时间而基准排程失接，且前车原到达早于后车原发车；组合不可重复。选中一组即要求后车发车
+        不早于前车调整后到达加换乘时间；额外晚点为全部所选班次末到相对基准排程的新增分钟数之和，不得超预算。
+        先使接上的旅客总数最大，再使额外晚点最小，再使选中组数最少。计算不修改时刻表。</p>
+      <div class="form-row">
+        <label>区间清空时间（分钟）
+          <input type="number" id="cp-clearance" min="0" max="30" step="1" value="10">
+        </label>
+        <label>额外晚点预算（分钟）
+          <input type="number" id="cp-budget" min="0" max="10000" step="1" value="60">
+        </label>
+        <button id="cp-select-all" type="button">全选（前 40 个）</button>
+        <button id="cp-clear" type="button">清空选择</button>
+        <span id="cp-count" class="hint">已选 0 个班次，总停靠 0 个</span>
+        <button id="cp-add-conn" type="button">添加换乘组</button>
+        <button id="cp-btn" class="primary">生成保联决策</button>
+      </div>
+      <div id="cp-train-list" class="stock-list"></div>
+      <div id="cp-conn-list"></div>
+      <div id="cp-result"></div>
+    </section>
+
+    <section class="card">
       <h2>导入时刻表</h2>
       <p class="hint">粘贴 JSON 时刻表或选择文件导入。校验失败时不会改动当前时刻表。</p>
       <div class="form-row">

@@ -150,7 +150,7 @@ button.primary:hover { background: var(--primary-dark); }
 .train { margin: 0.4rem 0; }
 .train summary { cursor: pointer; }
 
-.lock-row {
+.lock-row, .cp-conn-row {
   display: flex;
   flex-wrap: wrap;
   gap: 0.8rem;

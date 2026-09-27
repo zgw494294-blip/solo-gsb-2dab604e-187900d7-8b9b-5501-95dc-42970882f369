@@ -1,4 +1,4 @@
-"""列车换乘规划核心逻辑：时刻表校验、最早到达行程搜索、单站站台分配、单线区间冲突排查、车底接续规划、限座旅客疏运测算与区间延误传播排程。"""
+"""列车换乘规划核心逻辑：时刻表校验、最早到达行程搜索、单站站台分配、单线区间冲突排查、车底接续规划、限座旅客疏运测算、区间延误传播排程与换乘保联决策。"""
 from __future__ import annotations
 
 import bisect
@@ -1272,6 +1272,30 @@ def _compute_delay_schedule(timetable, train_ids, initial_delays, clearance_minu
     # 按（原发车时刻, 班次 ID, 停靠序号）升序传播：班内与区间依赖在该键下
     # 均严格递增，故每个发车时刻被处理时其全部前驱已定，直接取下界最大值
     clearance = timedelta(minutes=clearance_minutes)
+    adjusted_depart = _propagate_earliest(
+        selected, run, dwell, predecessor, delays, clearance, ()
+    )
+
+    return {
+        "selected": selected,
+        "delays": delays,
+        "clearance": clearance,
+        "run": run,
+        "dwell": dwell,
+        "predecessor": predecessor,
+        "adjusted_depart": adjusted_depart,
+        "total_stops": total_stops,
+    }
+
+
+def _propagate_earliest(selected, run, dwell, predecessor, delays, clearance,
+                        extra_bounds):
+    """逐项最早排程的传播核心：在班内、区间与额外下界下求各站调整后发车时刻。
+
+    extra_bounds：(班次 ID, 停靠序号) -> 额外发车下界（如保联的换乘接续约束）。
+    依赖键（原发车时刻, 班次 ID, 停靠序号）下全部依赖严格递增，按该键升序
+    处理即拓扑序，每个变量一次取足全部下界即为逐项最早解。
+    """
     adjusted_depart = {}  # (班次 ID, 停靠序号) -> 调整后发车时刻
     departures = sorted(
         (stop["depart"], train["id"], sidx)
@@ -1289,18 +1313,11 @@ def _compute_delay_schedule(timetable, train_ids, initial_delays, clearance_minu
         pred = predecessor.get((tid, sidx))
         if pred is not None:
             lower = max(lower, adjusted_depart[pred] + run[pred] + clearance)
+        extra = extra_bounds.get((tid, sidx)) if extra_bounds else None
+        if extra is not None:
+            lower = max(lower, extra)
         adjusted_depart[(tid, sidx)] = lower
-
-    return {
-        "selected": selected,
-        "delays": delays,
-        "clearance": clearance,
-        "run": run,
-        "dwell": dwell,
-        "predecessor": predecessor,
-        "adjusted_depart": adjusted_depart,
-        "total_stops": total_stops,
-    }
+    return adjusted_depart
 
 
 def plan_delay_propagation(timetable, train_ids, initial_delays, clearance_minutes):
@@ -1587,3 +1604,293 @@ def attribute_delay_propagation(timetable, train_ids, initial_delays, clearance_
             }
         )
     return {"trains": result_trains, "total_stops": schedule["total_stops"]}
+
+
+# ---------- 换乘保联决策 ----------
+
+MAX_EXTRA_DELAY_MINUTES = 10000   # 额外晚点预算上限（分钟）
+MIN_EXTRA_DELAY_MINUTES = 0       # 额外晚点预算下限（分钟）
+MAX_CONNECTIONS = 8               # 单次决策的换乘组数上限
+MIN_CONNECTIONS = 1               # 单次决策的换乘组数下限
+MAX_CONNECTION_PEOPLE = 1000      # 单组旅客人数上限
+MIN_CONNECTION_PEOPLE = 1         # 单组旅客人数下限
+
+
+def _validate_connections(timetable, connections, selected_ids):
+    """校验换乘组列表，返回规范化结构；无效输入抛 TimetableError。
+
+    每组换乘须满足：
+    - from_train / to_train 是所选班次中的两个不同班次；
+    - from_stop / to_stop 为从 0 起的停靠序号，且两次停靠在同一站点；
+    - 前车原到达早于后车原发车，且原表满足本站换乘时间
+      （后车原发车 >= 前车原到达 + 换乘分钟）；
+    - 基准排程（含首发延误传播的逐项最早排程）失接
+      （基准后车发车 < 基准前车到达 + 换乘分钟）；
+    - people 为 1～1000 的整数；
+    - 组合（前后班次、前后停靠序号）不重复。
+    """
+    if not isinstance(connections, list):
+        raise TimetableError("connections 必须是数组")
+    if not MIN_CONNECTIONS <= len(connections) <= MAX_CONNECTIONS:
+        raise TimetableError(
+            f"换乘组数必须为 {MIN_CONNECTIONS}～{MAX_CONNECTIONS} 组，"
+            f"实际为 {len(connections)} 组"
+        )
+    trains_by_id = {train["id"]: train for train in timetable["trains"]}
+    stations = timetable["stations"]
+    seen = set()
+    normalized = []
+    for idx, conn in enumerate(connections):
+        where = f"connections[{idx}]"
+        if not isinstance(conn, dict):
+            raise TimetableError(f"{where}: 换乘组必须是对象")
+        from_id = conn.get("from_train")
+        to_id = conn.get("to_train")
+        for field, tid in (("from_train", from_id), ("to_train", to_id)):
+            if not isinstance(tid, str) or tid not in selected_ids:
+                raise TimetableError(f"{where}: {field} {tid!r} 不是所选班次")
+        if from_id == to_id:
+            raise TimetableError(f"{where}: 前后班次不能相同")
+        from_train = trains_by_id[from_id]
+        to_train = trains_by_id[to_id]
+
+        def stop_index(raw, field, train, tid):
+            if (
+                isinstance(raw, bool)
+                or not isinstance(raw, int)
+                or not 0 <= raw < len(train["stops"])
+            ):
+                raise TimetableError(
+                    f"{where}: {field} {raw!r} 超出班次 {tid} 的停靠序号范围"
+                    f"（0～{len(train['stops']) - 1}）"
+                )
+            return raw
+
+        from_stop = stop_index(
+            conn.get("from_stop"), "from_stop", from_train, from_id
+        )
+        to_stop = stop_index(conn.get("to_stop"), "to_stop", to_train, to_id)
+        from_entry = from_train["stops"][from_stop]
+        to_entry = to_train["stops"][to_stop]
+        if from_entry["station"] != to_entry["station"]:
+            raise TimetableError(
+                f"{where}: 前后班次须在同一站点换乘（{from_entry['station']!r} "
+                f"与 {to_entry['station']!r} 不同）"
+            )
+        station = from_entry["station"]
+        orig_arrive = from_entry["arrive"]
+        if orig_arrive is None:
+            raise TimetableError(f"{where}: 班次 {from_id} 第 {from_stop} 次停靠没有到达时间")
+        orig_depart = to_entry["depart"]
+        if orig_depart is None:
+            raise TimetableError(f"{where}: 班次 {to_id} 第 {to_stop} 次停靠没有发车时间")
+        transfer = timedelta(minutes=stations[station]["transfer_minutes"])
+        if not orig_arrive < orig_depart:
+            raise TimetableError(
+                f"{where}: 前车原到达须早于后车原发车"
+                f"（{format_time(orig_arrive)} 不早于 {format_time(orig_depart)}）"
+            )
+        if orig_depart < orig_arrive + transfer:
+            raise TimetableError(
+                f"{where}: 原时刻表不满足本站换乘时间（{format_time(orig_depart)} 早于 "
+                f"{format_time(orig_arrive)} + {stations[station]['transfer_minutes']} 分钟）"
+            )
+        people = conn.get("people")
+        if (
+            isinstance(people, bool)
+            or not isinstance(people, int)
+            or not MIN_CONNECTION_PEOPLE <= people <= MAX_CONNECTION_PEOPLE
+        ):
+            raise TimetableError(
+                f"{where}: 人数必须是 {MIN_CONNECTION_PEOPLE}～{MAX_CONNECTION_PEOPLE} "
+                f"的整数，实际为 {people!r}"
+            )
+        key = (from_id, from_stop, to_id, to_stop)
+        if key in seen:
+            raise TimetableError(f"{where}: 与前面的换乘组重复")
+        seen.add(key)
+        normalized.append(
+            {
+                "index": idx,
+                "from_train": from_id,
+                "from_stop": from_stop,
+                "to_train": to_id,
+                "to_stop": to_stop,
+                "station": station,
+                "people": people,
+                "transfer": transfer,
+            }
+        )
+    return normalized
+
+
+def plan_connection_protection(timetable, train_ids, initial_delays,
+                               clearance_minutes, max_extra_delay_minutes,
+                               connections):
+    """在额外晚点预算内选择换乘组保联，使接上的旅客最多、额外晚点最小。
+
+    输入沿用区间延误传播排程的参数（所选班次、首发延误、清空间隔），另加：
+    - max_extra_delay_minutes：0～10000 的整数，全部所选班次末到相对基准排程
+      新增延误分钟数之和的上限；
+    - connections：1～8 组换乘（前后班次及停靠序号、人数），每组须为不同班次
+      在同站的换乘，原表满足本站换乘时间而基准排程失接，前车原到达早于后车
+      原发车，人数 1～1000，组合不重复。
+
+    选中一组即在排程中追加约束：后车该站发车不早于前车调整后到达 + 本站换乘
+    分钟；其余约束与逐项最早传播同区间延误传播排程。额外晚点 = 各所选班次
+    末到相对基准排程的新增分钟数之和，不得超预算。
+
+    目标按字典序：先使最终接上的旅客总数最大，再使额外晚点最小，再使选中
+    组数最少，仍并列时取选中输入序号列表字典序最小者。换乘组数至多 8 组，
+    枚举全部子集（含空集至多 256 个）精确求解。计算只读，不修改时刻表。
+
+    返回 {"selected_indices", "protected", "protected_people",
+    "extra_delay_minutes", "trains", "total_stops"}：selected_indices 为选中的
+    输入序号（升序）；protected 为实际接上的组（基准失接、调整后可接续的组，
+    按输入顺序）；trains 与区间延误传播排程同构（每班调整后停靠时刻、末到
+    延误及相对基准排程的新增分钟数）。
+    """
+    if (
+        isinstance(max_extra_delay_minutes, bool)
+        or not isinstance(max_extra_delay_minutes, int)
+        or not MIN_EXTRA_DELAY_MINUTES <= max_extra_delay_minutes <= MAX_EXTRA_DELAY_MINUTES
+    ):
+        raise TimetableError(
+            f"额外晚点预算必须是 {MIN_EXTRA_DELAY_MINUTES}～{MAX_EXTRA_DELAY_MINUTES} "
+            f"的整数分钟，实际为 {max_extra_delay_minutes!r}"
+        )
+    schedule = _compute_delay_schedule(
+        timetable, train_ids, initial_delays, clearance_minutes
+    )
+    selected = schedule["selected"]
+    selected_ids = {train["id"] for train in selected}
+    conns = _validate_connections(timetable, connections, selected_ids)
+
+    run = schedule["run"]
+    dwell = schedule["dwell"]
+    predecessor = schedule["predecessor"]
+    delays = schedule["delays"]
+    clearance = schedule["clearance"]
+    base_depart = schedule["adjusted_depart"]
+
+    def adjusted_arrive(adjusted, tid, sidx):
+        """调整后到达时刻（sidx >= 1）：上一站调整后发车 + 原运行时长。"""
+        return adjusted[(tid, sidx - 1)] + run[(tid, sidx - 1)]
+
+    def final_arrive(adjusted, train):
+        return adjusted_arrive(adjusted, train["id"], len(train["stops"]) - 1)
+
+    # 基准排程下各换乘组的接续状态：校验保证原表可接续，此处须为失接
+    for conn in conns:
+        gap = (
+            base_depart[(conn["to_train"], conn["to_stop"])]
+            - adjusted_arrive(base_depart, conn["from_train"], conn["from_stop"])
+        )
+        if gap >= conn["transfer"]:
+            raise TimetableError(
+                f"connections[{conn['index']}]: 基准排程下该换乘未失接"
+                "（基准后车发车不早于基准前车到达 + 换乘分钟），无需保联"
+            )
+
+    base_final = {train["id"]: final_arrive(base_depart, train) for train in selected}
+
+    def evaluate(subset):
+        """评估一个选中子集：返回 (额外晚点分钟, 调整后发车表)；超预算返回 None。"""
+        extra_bounds = {}
+        for i in subset:
+            conn = conns[i]
+            key = (conn["to_train"], conn["to_stop"])
+            bound = (
+                adjusted_arrive(base_depart, conn["from_train"], conn["from_stop"])
+                + conn["transfer"]
+            )
+            if key not in extra_bounds or bound > extra_bounds[key]:
+                extra_bounds[key] = bound
+        adjusted = _propagate_earliest(
+            selected, run, dwell, predecessor, delays, clearance, extra_bounds
+        )
+        extra = sum(
+            int((final_arrive(adjusted, train) - base_final[train["id"]]).total_seconds() // 60)
+            for train in selected
+        )
+        if extra > max_extra_delay_minutes:
+            return None
+        return extra, adjusted
+
+    # 枚举全部子集，按（接上旅客数降序、额外晚点升序、组数升序、序号列表字典序）
+    # 取最优；空集恒可行，作为全不可行时的保底
+    best_key = None
+    best_subset = ()
+    best_extra = 0
+    best_adjusted = base_depart
+    for size in range(len(conns) + 1):
+        for subset in itertools.combinations(range(len(conns)), size):
+            outcome = evaluate(subset)
+            if outcome is None:
+                continue
+            extra, adjusted = outcome
+            people = sum(
+                conn["people"]
+                for i, conn in enumerate(conns)
+                if adjusted_arrive(adjusted, conn["from_train"], conn["from_stop"])
+                + conn["transfer"]
+                <= adjusted[(conn["to_train"], conn["to_stop"])]
+            )
+            key = (-people, extra, size, list(subset))
+            if best_key is None or key < best_key:
+                best_key = key
+                best_subset = subset
+                best_extra = extra
+                best_adjusted = adjusted
+
+    protected = [
+        i
+        for i, conn in enumerate(conns)
+        if adjusted_arrive(best_adjusted, conn["from_train"], conn["from_stop"])
+        + conn["transfer"]
+        <= best_adjusted[(conn["to_train"], conn["to_stop"])]
+    ]
+    protected_people = sum(conns[i]["people"] for i in protected)
+
+    result_trains = []
+    for train in selected:
+        tid = train["id"]
+        stops = train["stops"]
+        adjusted_stops = []
+        for sidx, stop in enumerate(stops):
+            arrive = (
+                adjusted_arrive(best_adjusted, tid, sidx) if sidx > 0 else None
+            )
+            depart = best_adjusted.get((tid, sidx))
+            adjusted_stops.append(
+                {
+                    "station": stop["station"],
+                    "arrive": arrive,
+                    "depart": depart,
+                    "original_arrive": stop["arrive"],
+                    "original_depart": stop["depart"],
+                }
+            )
+        final = adjusted_stops[-1]["arrive"]
+        result_trains.append(
+            {
+                "train_id": tid,
+                "initial_delay_minutes": delays.get(tid, 0),
+                "final_delay_minutes": int(
+                    (final - stops[-1]["arrive"]).total_seconds() // 60
+                ),
+                "extra_delay_minutes": int(
+                    (final - base_final[tid]).total_seconds() // 60
+                ),
+                "stops": adjusted_stops,
+            }
+        )
+
+    return {
+        "selected_indices": sorted(best_subset),
+        "protected": protected,
+        "protected_people": protected_people,
+        "extra_delay_minutes": best_extra,
+        "trains": result_trains,
+        "total_stops": schedule["total_stops"],
+    }

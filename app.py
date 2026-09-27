@@ -748,6 +748,63 @@ def create_app():
             }
         )
 
+    @app.post("/api/connection-protection")
+    def api_connection_protection():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求体必须是 JSON 对象"}), 400
+        tt = load_timetable()
+        if not tt["stations"]:
+            return jsonify({"ok": False, "error": "尚未导入时刻表，请先导入"}), 400
+        try:
+            result = planner.plan_connection_protection(
+                tt,
+                data.get("train_ids"),
+                data.get("initial_delays"),
+                data.get("clearance_minutes"),
+                data.get("max_extra_delay_minutes"),
+                data.get("connections"),
+            )
+        except planner.TimetableError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+
+        def stop_json(stop):
+            return {
+                "station": stop["station"],
+                "arrive": planner.format_time(stop["arrive"]) if stop["arrive"] else None,
+                "depart": planner.format_time(stop["depart"]) if stop["depart"] else None,
+                "original_arrive": planner.format_time(stop["original_arrive"])
+                if stop["original_arrive"]
+                else None,
+                "original_depart": planner.format_time(stop["original_depart"])
+                if stop["original_depart"]
+                else None,
+            }
+
+        return jsonify(
+            {
+                "ok": True,
+                "clearance_minutes": data["clearance_minutes"],
+                "max_extra_delay_minutes": data["max_extra_delay_minutes"],
+                "selected_indices": result["selected_indices"],
+                "protected": result["protected"],
+                "protected_people": result["protected_people"],
+                "extra_delay_minutes": result["extra_delay_minutes"],
+                "train_count": len(result["trains"]),
+                "total_stops": result["total_stops"],
+                "trains": [
+                    {
+                        "train_id": item["train_id"],
+                        "initial_delay_minutes": item["initial_delay_minutes"],
+                        "final_delay_minutes": item["final_delay_minutes"],
+                        "extra_delay_minutes": item["extra_delay_minutes"],
+                        "stops": [stop_json(stop) for stop in item["stops"]],
+                    }
+                    for item in result["trains"]
+                ],
+            }
+        )
+
     # 初始化数据库；为空时尝试导入示例数据，方便直接体验
     db_dir = os.path.dirname(app.config["DB_PATH"])
     if db_dir:

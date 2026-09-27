@@ -72,10 +72,13 @@ async function loadTimetable() {
   $("flow-result").innerHTML = "";
   $("delay-result").innerHTML = "";
   $("delay-attribution").innerHTML = "";
+  $("cp-conn-list").innerHTML = "";
+  $("cp-result").innerHTML = "";
   renderTrains(data.trains);
   renderStockTrainPicker(data.trains);
   renderFlowTrainPicker(data.trains);
   renderDelayTrainPicker(data.trains);
+  renderCpTrainPicker(data.trains);
   await loadVersions();
 }
 
@@ -1009,5 +1012,262 @@ $("delay-clear").addEventListener("click", () => {
 });
 $("delay-btn").addEventListener("click", doDelayPlan);
 $("delay-attr-btn").addEventListener("click", doDelayAttribution);
+
+// ---------- 换乘保联决策 ----------
+
+function renderCpTrainPicker(trains) {
+  const box = $("cp-train-list");
+  if (!trains.length) {
+    box.innerHTML = '<p class="hint">暂无班次。</p>';
+    updateCpCount();
+    return;
+  }
+  box.innerHTML = trains.map((t) => {
+    const first = t.stops[0];
+    const last = t.stops[t.stops.length - 1];
+    return `<label class="stock-item">
+      <input type="checkbox" class="cp-check" value="${esc(t.id)}">
+      <input type="number" class="cp-minutes" min="0" max="120" step="1" value="0"
+        title="班次 ${esc(t.id)} 的首发延误分钟数（0～120）">
+      <strong>${esc(t.id)}</strong>
+      <span>${esc(stationLabel(first.station))} ${fmtTime(first.depart)} 发车 →
+        ${esc(stationLabel(last.station))} ${fmtTime(last.arrive)} 到达（${t.stops.length} 站）</span>
+    </label>`;
+  }).join("");
+  box.querySelectorAll(".cp-check").forEach((cb) => {
+    cb.addEventListener("change", (e) => {
+      if (e.target.checked && countCpChecked() > 40) {
+        e.target.checked = false;
+        window.alert("最多选择 40 个班次，请先取消部分选择。");
+      }
+      updateCpCount();
+    });
+  });
+  updateCpCount();
+}
+
+function countCpChecked() {
+  return document.querySelectorAll("#cp-train-list .cp-check:checked").length;
+}
+
+function cpTotalStops() {
+  let total = 0;
+  document.querySelectorAll("#cp-train-list .cp-check:checked").forEach((cb) => {
+    const t = trainsCache.find((x) => x.id === cb.value);
+    if (t) total += t.stops.length;
+  });
+  return total;
+}
+
+function updateCpCount() {
+  $("cp-count").textContent =
+    `已选 ${countCpChecked()} 个班次，总停靠 ${cpTotalStops()} 个（1～40 班，总停靠 ≤ 200）`;
+}
+
+function addCpConnRow() {
+  if (document.querySelectorAll("#cp-conn-list .cp-conn-row").length >= 8) {
+    window.alert("最多添加 8 组换乘。");
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "cp-conn-row";
+  const fromSel = document.createElement("select");
+  fromSel.className = "cp-from-train";
+  const toSel = document.createElement("select");
+  toSel.className = "cp-to-train";
+  for (const t of trainsCache) {
+    fromSel.appendChild(new Option(t.id, t.id));
+    toSel.appendChild(new Option(t.id, t.id));
+  }
+  if (trainsCache.length > 1) toSel.selectedIndex = 1;
+  const fromStop = document.createElement("input");
+  fromStop.type = "number";
+  fromStop.className = "cp-from-stop";
+  fromStop.min = "0";
+  fromStop.value = "0";
+  const toStop = document.createElement("input");
+  toStop.type = "number";
+  toStop.className = "cp-to-stop";
+  toStop.min = "0";
+  toStop.value = "0";
+  const people = document.createElement("input");
+  people.type = "number";
+  people.className = "cp-people";
+  people.min = "1";
+  people.max = "1000";
+  people.value = "1";
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.textContent = "删除";
+  removeBtn.addEventListener("click", () => row.remove());
+  for (const [text, el] of [
+    ["前车班次", fromSel], ["前车停靠序号", fromStop],
+    ["后车班次", toSel], ["后车停靠序号", toStop], ["人数", people],
+  ]) {
+    const label = document.createElement("label");
+    label.append(text, el);
+    row.appendChild(label);
+  }
+  row.appendChild(removeBtn);
+  $("cp-conn-list").appendChild(row);
+}
+
+function collectCpRequest(box) {
+  // 收集并前端校验“换乘保联决策”卡片的输入
+  const checks = [...document.querySelectorAll("#cp-train-list .cp-check:checked")];
+  if (!checks.length) {
+    box.innerHTML = '<p class="error">请至少勾选 1 个班次。</p>';
+    return null;
+  }
+  if (checks.length > 40) {
+    box.innerHTML = '<p class="error">最多选择 40 个班次。</p>';
+    return null;
+  }
+  const clearance = parseInt($("cp-clearance").value, 10);
+  if (Number.isNaN(clearance) || clearance < 0 || clearance > 30) {
+    box.innerHTML = '<p class="error">区间清空时间必须是 0～30 的整数分钟。</p>';
+    return null;
+  }
+  const budget = parseInt($("cp-budget").value, 10);
+  if (Number.isNaN(budget) || budget < 0 || budget > 10000) {
+    box.innerHTML = '<p class="error">额外晚点预算必须是 0～10000 的整数分钟。</p>';
+    return null;
+  }
+  const trainIds = [];
+  const initialDelays = {};
+  for (const cb of checks) {
+    trainIds.push(cb.value);
+    const minutes = parseInt(
+      cb.closest(".stock-item").querySelector(".cp-minutes").value, 10);
+    if (Number.isNaN(minutes) || minutes < 0 || minutes > 120) {
+      box.innerHTML = `<p class="error">班次 ${esc(cb.value)} 的首发延误必须是 0～120 的整数分钟。</p>`;
+      return null;
+    }
+    if (minutes > 0) initialDelays[cb.value] = minutes;
+  }
+  if (cpTotalStops() > 200) {
+    box.innerHTML = '<p class="error">所选班次总停靠数超过 200，请减少勾选班次。</p>';
+    return null;
+  }
+  const rows = [...document.querySelectorAll("#cp-conn-list .cp-conn-row")];
+  if (!rows.length) {
+    box.innerHTML = '<p class="error">请添加 1～8 组换乘。</p>';
+    return null;
+  }
+  if (rows.length > 8) {
+    box.innerHTML = '<p class="error">最多添加 8 组换乘。</p>';
+    return null;
+  }
+  const connections = [];
+  for (const row of rows) {
+    const fromStop = parseInt(row.querySelector(".cp-from-stop").value, 10);
+    const toStop = parseInt(row.querySelector(".cp-to-stop").value, 10);
+    const people = parseInt(row.querySelector(".cp-people").value, 10);
+    if ([fromStop, toStop, people].some(Number.isNaN)) {
+      box.innerHTML = '<p class="error">换乘组的停靠序号与人数必须填写整数。</p>';
+      return null;
+    }
+    if (people < 1 || people > 1000) {
+      box.innerHTML = '<p class="error">每组人数必须是 1～1000 的整数。</p>';
+      return null;
+    }
+    connections.push({
+      from_train: row.querySelector(".cp-from-train").value,
+      from_stop: fromStop,
+      to_train: row.querySelector(".cp-to-train").value,
+      to_stop: toStop,
+      people,
+    });
+  }
+  return {
+    train_ids: trainIds,
+    initial_delays: initialDelays,
+    clearance_minutes: clearance,
+    max_extra_delay_minutes: budget,
+    connections,
+  };
+}
+
+async function doConnectionProtection() {
+  const box = $("cp-result");
+  const payload = collectCpRequest(box);
+  if (!payload) return;
+  box.innerHTML = '<p class="hint">计算中…</p>';
+  let data;
+  try {
+    const res = await fetch("/api/connection-protection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    data = await res.json();
+  } catch (e) {
+    box.innerHTML = `<p class="error">请求失败：${esc(e.message)}</p>`;
+    return;
+  }
+  if (!data.ok) {
+    box.innerHTML = `<p class="error">${esc(data.error)}</p>`;
+    return;
+  }
+  renderConnectionProtection(data, payload.connections);
+}
+
+function renderConnectionProtection(data, connections) {
+  const parts = [];
+  const selected = new Set(data.selected_indices);
+  const protectedSet = new Set(data.protected);
+  parts.push(`<div class="summary">额外晚点预算 ${data.max_extra_delay_minutes} 分钟，
+    实际新增额外晚点 <strong>${data.extra_delay_minutes}</strong> 分钟；
+    接上旅客 <strong>${data.protected_people}</strong> 人，
+    选中保联 ${data.selected_indices.length} 组（输入序号：
+    ${data.selected_indices.length ? data.selected_indices.join("、") : "无"}），
+    实际接上 ${data.protected.length} 组（输入序号：
+    ${data.protected.length ? data.protected.join("、") : "无"}）。</div>`);
+  const rows = connections.map((conn, i) => {
+    const status = protectedSet.has(i)
+      ? (selected.has(i) ? '<span class="badge-ontime">选中保联，已接上</span>'
+        : '<span class="badge-ontime">未选中，随排程接上</span>')
+      : '<span class="badge-delayed">未接上</span>';
+    return `<tr><td>${i}</td>` +
+      `<td><strong>${esc(conn.from_train)}</strong>（停靠 #${conn.from_stop}）</td>` +
+      `<td><strong>${esc(conn.to_train)}</strong>（停靠 #${conn.to_stop}）</td>` +
+      `<td>${conn.people}</td><td>${status}</td></tr>`;
+  }).join("");
+  parts.push(`<table><thead><tr><th>输入序号</th><th>前车</th><th>后车</th>
+    <th>人数</th><th>结果</th></tr></thead><tbody>${rows}</tbody></table>`);
+  data.trains.forEach((t) => {
+    const badge = t.extra_delay_minutes > 0
+      ? `<span class="badge-delayed">额外晚点 ${fmtDuration(t.extra_delay_minutes)}</span>`
+      : (t.final_delay_minutes > 0
+        ? `<span class="badge-delayed">末到延误 ${fmtDuration(t.final_delay_minutes)}</span>`
+        : '<span class="badge-ontime">正点</span>');
+    const rows = t.stops.map((s) =>
+      `<tr><td>${esc(stationLabel(s.station))}</td>` +
+      `<td>${fmtTime(s.original_arrive)}</td><td>${fmtTime(s.original_depart)}</td>` +
+      `${delayTimeCell(s.arrive, s.original_arrive)}` +
+      `${delayTimeCell(s.depart, s.original_depart)}</tr>`
+    ).join("");
+    parts.push(`<div class="stock-chain">
+      <div class="stock-chain-head"><span class="train-no">${esc(t.train_id)}</span>
+        首发延误 ${t.initial_delay_minutes} 分钟 ${badge}</div>
+      <table><thead><tr><th>站点</th><th>原定到达</th><th>原定发车</th>
+        <th>调整到达</th><th>调整发车</th></tr></thead>
+      <tbody>${rows}</tbody></table></div>`);
+  });
+  $("cp-result").innerHTML = parts.join("");
+}
+
+$("cp-select-all").addEventListener("click", () => {
+  const boxes = [...document.querySelectorAll("#cp-train-list .cp-check")];
+  boxes.forEach((cb, i) => { cb.checked = i < 40; });
+  updateCpCount();
+});
+$("cp-clear").addEventListener("click", () => {
+  document.querySelectorAll("#cp-train-list .cp-check")
+    .forEach((cb) => { cb.checked = false; });
+  updateCpCount();
+});
+$("cp-add-conn").addEventListener("click", addCpConnRow);
+$("cp-btn").addEventListener("click", doConnectionProtection);
 
 loadTimetable();
