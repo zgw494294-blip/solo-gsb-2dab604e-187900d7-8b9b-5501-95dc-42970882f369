@@ -142,6 +142,27 @@
     </section>
 
     <section class="card">
+      <h2>换乘保联决策</h2>
+      <p class="hint">沿用上方「区间延误传播排程」卡片的班次、首发延误与区间清空时间输入，
+        另填 0～10000 分钟额外晚点预算与 1～8 组旅客（每组：前车班次与到达停靠序号、后车班次与
+        发车停靠序号、1～1000 人）。每组须为不同班次在同站的换乘：原时刻表满足本站换乘时间、
+        前车原到达早于后车原发车，而基准排程失接；组合不重复。选中一组即要求后车发车不早于
+        前车调整后到达加换乘时间，沿既有班内与固定区间顺序求逐项最早排程；额外晚点为所有所选
+        班次末到相对基准排程新增分钟数之和，不得超预算。决策先使接上的旅客总数最大，再使额外
+        晚点最小，再使选中组数最少。计算不修改时刻表。</p>
+      <div class="form-row">
+        <label>额外晚点预算（分钟）
+          <input type="number" id="cp-budget" min="0" max="10000" step="1" value="60">
+        </label>
+        <button id="cp-add-conn" type="button">添加旅客组</button>
+        <span id="cp-count" class="hint">已填 0 组（1～8）</span>
+        <button id="cp-btn" class="primary">保联决策</button>
+      </div>
+      <div id="cp-conn-list"></div>
+      <div id="cp-result"></div>
+    </section>
+
+    <section class="card">
       <h2>导入时刻表</h2>
       <p class="hint">粘贴 JSON 时刻表或选择文件导入。校验失败时不会改动当前时刻表。</p>
       <div class="form-row">

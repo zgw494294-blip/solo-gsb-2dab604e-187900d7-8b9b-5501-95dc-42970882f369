@@ -72,6 +72,9 @@ async function loadTimetable() {
   $("flow-result").innerHTML = "";
   $("delay-result").innerHTML = "";
   $("delay-attribution").innerHTML = "";
+  $("cp-conn-list").innerHTML = "";
+  $("cp-result").innerHTML = "";
+  updateConnCount();
   renderTrains(data.trains);
   renderStockTrainPicker(data.trains);
   renderFlowTrainPicker(data.trains);
@@ -1009,5 +1012,180 @@ $("delay-clear").addEventListener("click", () => {
 });
 $("delay-btn").addEventListener("click", doDelayPlan);
 $("delay-attr-btn").addEventListener("click", doDelayAttribution);
+
+// ---------- 换乘保联决策 ----------
+
+function updateConnCount() {
+  const count = document.querySelectorAll("#cp-conn-list .lock-row").length;
+  $("cp-count").textContent = `已填 ${count} 组（1～8）`;
+  // 行内序号徽标与 API 返回的输入序号一致（从 0 起）
+  document.querySelectorAll("#cp-conn-list .conn-index").forEach((el, i) => {
+    el.textContent = `#${i}`;
+  });
+}
+
+function addConnRow() {
+  const list = $("cp-conn-list");
+  if (list.querySelectorAll(".lock-row").length >= 8) {
+    window.alert("最多 8 组旅客，请先删除部分组。");
+    return;
+  }
+  const row = document.createElement("div");
+  row.className = "lock-row";
+  const indexBadge = document.createElement("span");
+  indexBadge.className = "conn-index train-no";
+  row.appendChild(indexBadge);
+  const fromTrainSel = document.createElement("select");
+  fromTrainSel.className = "conn-from-train";
+  const toTrainSel = document.createElement("select");
+  toTrainSel.className = "conn-to-train";
+  for (const t of trainsCache) {
+    for (const sel of [fromTrainSel, toTrainSel]) {
+      const opt = document.createElement("option");
+      opt.value = t.id;
+      opt.textContent = t.id;
+      sel.appendChild(opt);
+    }
+  }
+  if (trainsCache.length > 1) toTrainSel.selectedIndex = 1;
+  const fromStopInput = document.createElement("input");
+  fromStopInput.type = "number";
+  fromStopInput.className = "conn-from-stop";
+  fromStopInput.min = "0";
+  fromStopInput.value = "1";
+  const toStopInput = document.createElement("input");
+  toStopInput.type = "number";
+  toStopInput.className = "conn-to-stop";
+  toStopInput.min = "0";
+  toStopInput.value = "0";
+  const peopleInput = document.createElement("input");
+  peopleInput.type = "number";
+  peopleInput.className = "conn-people";
+  peopleInput.min = "1";
+  peopleInput.max = "1000";
+  peopleInput.value = "10";
+  const removeBtn = document.createElement("button");
+  removeBtn.type = "button";
+  removeBtn.textContent = "删除";
+  removeBtn.addEventListener("click", () => {
+    row.remove();
+    updateConnCount();
+  });
+  for (const [text, el] of [
+    ["前车班次", fromTrainSel],
+    ["前车停靠序号（到达）", fromStopInput],
+    ["后车班次", toTrainSel],
+    ["后车停靠序号（发车）", toStopInput],
+    ["人数", peopleInput],
+  ]) {
+    const label = document.createElement("label");
+    label.append(text, el);
+    row.appendChild(label);
+  }
+  row.appendChild(removeBtn);
+  list.appendChild(row);
+  updateConnCount();
+}
+
+async function doConnectionProtection() {
+  const box = $("cp-result");
+  // 沿用「区间延误传播排程」卡片的班次、首发延误与清空时间输入
+  const payload = collectDelayRequest(box);
+  if (!payload) return;
+  const budget = parseInt($("cp-budget").value, 10);
+  if (Number.isNaN(budget) || budget < 0 || budget > 10000) {
+    box.innerHTML = '<p class="error">额外晚点预算必须是 0～10000 的整数分钟。</p>';
+    return;
+  }
+  const rows = [...document.querySelectorAll("#cp-conn-list .lock-row")];
+  if (!rows.length || rows.length > 8) {
+    box.innerHTML = '<p class="error">请填写 1～8 组旅客。</p>';
+    return;
+  }
+  const connections = [];
+  for (const row of rows) {
+    const fromStop = parseInt(row.querySelector(".conn-from-stop").value, 10);
+    const toStop = parseInt(row.querySelector(".conn-to-stop").value, 10);
+    const people = parseInt(row.querySelector(".conn-people").value, 10);
+    if ([fromStop, toStop, people].some(Number.isNaN)) {
+      box.innerHTML = '<p class="error">每组的前后停靠序号与人数都必须填写整数。</p>';
+      return;
+    }
+    connections.push({
+      from_train: row.querySelector(".conn-from-train").value,
+      from_stop_index: fromStop,
+      to_train: row.querySelector(".conn-to-train").value,
+      to_stop_index: toStop,
+      people,
+    });
+  }
+  payload.max_extra_delay_minutes = budget;
+  payload.connections = connections;
+  box.innerHTML = '<p class="hint">计算中…</p>';
+  let data;
+  try {
+    const res = await fetch("/api/connection-protection", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    data = await res.json();
+  } catch (e) {
+    box.innerHTML = `<p class="error">请求失败：${esc(e.message)}</p>`;
+    return;
+  }
+  if (!data.ok) {
+    box.innerHTML = `<p class="error">${esc(data.error)}</p>`;
+    return;
+  }
+  renderConnectionProtection(data, connections);
+}
+
+function renderConnectionProtection(data, connections) {
+  const parts = [];
+  const selectedSet = new Set(data.selected);
+  const connectedSet = new Set(data.connected);
+  const fmtIndices = (list) => list.length ? list.map((i) => `#${i}`).join("、") : "无";
+  parts.push(`<div class="summary">额外晚点预算 ${data.max_extra_delay_minutes} 分钟：
+    选中保护 <strong>${data.selected.length}</strong> 组（${fmtIndices(data.selected)}），
+    实际接上 <strong>${data.connected.length}</strong> 组（${fmtIndices(data.connected)}），
+    接上旅客 <strong>${data.protected_passengers}</strong> 人，
+    新增晚点合计 <strong>${fmtDuration(data.extra_delay_minutes)}</strong>。</div>`);
+  if (!data.selected.length) {
+    parts.push('<p class="notfound">🚫 预算内无法保上任何换乘组，维持基准排程（未改动任何时刻）。</p>');
+  }
+  const connRows = connections.map((c, i) => {
+    const status = selectedSet.has(i)
+      ? "✅ 选中保护"
+      : (connectedSet.has(i) ? "🔗 未选中但也接上" : "❌ 未接上");
+    return `<tr><td>#${i}</td>` +
+      `<td><strong>${esc(c.from_train)}</strong> 停靠 #${c.from_stop_index}</td>` +
+      `<td><strong>${esc(c.to_train)}</strong> 停靠 #${c.to_stop_index}</td>` +
+      `<td>${c.people}</td><td>${status}</td></tr>`;
+  }).join("");
+  parts.push(`<table><thead><tr><th>序号</th><th>前车（到达）</th><th>后车（发车）</th>` +
+    `<th>人数</th><th>结果</th></tr></thead><tbody>${connRows}</tbody></table>`);
+  data.trains.forEach((t) => {
+    const badge = t.final_delay_minutes > 0
+      ? `<span class="badge-delayed">末到延误 ${fmtDuration(t.final_delay_minutes)}</span>`
+      : '<span class="badge-ontime">正点</span>';
+    const stopRows = t.stops.map((s) =>
+      `<tr><td>${esc(stationLabel(s.station))}</td>` +
+      `<td>${fmtTime(s.original_arrive)}</td><td>${fmtTime(s.original_depart)}</td>` +
+      `${delayTimeCell(s.arrive, s.original_arrive)}` +
+      `${delayTimeCell(s.depart, s.original_depart)}</tr>`
+    ).join("");
+    parts.push(`<div class="stock-chain">
+      <div class="stock-chain-head"><span class="train-no">${esc(t.train_id)}</span>
+        首发延误 ${t.initial_delay_minutes} 分钟 ${badge}</div>
+      <table><thead><tr><th>站点</th><th>原定到达</th><th>原定发车</th>
+        <th>调整到达</th><th>调整发车</th></tr></thead>
+      <tbody>${stopRows}</tbody></table></div>`);
+  });
+  $("cp-result").innerHTML = parts.join("");
+}
+
+$("cp-add-conn").addEventListener("click", addConnRow);
+$("cp-btn").addEventListener("click", doConnectionProtection);
 
 loadTimetable();
